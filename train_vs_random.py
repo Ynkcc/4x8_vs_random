@@ -44,8 +44,9 @@ ENTROPY_COEF_FINAL = 0.001
 WEIGHT_DECAY = 1e-5
 
 # 全局统计变量，用于回报的运行标准化
-running_mean = 0.0
-running_std = 1.0
+# [修改] running_mean 和 running_std 不再需要，因为我们不再归一化回报
+# running_mean = 0.0
+# running_std = 1.0
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -154,7 +155,8 @@ def normalize_tensor(tensor):
 
 
 def train_vs_random(n_episodes=N_EPISODES, max_t=MAX_T, log_dir=LOG_DIR):
-    global running_mean, running_std
+    # [修改] 全局变量不再需要
+    # global running_mean, running_std
     
     os.makedirs(log_dir, exist_ok=True)
     
@@ -265,27 +267,33 @@ def train_vs_random(n_episodes=N_EPISODES, max_t=MAX_T, log_dir=LOG_DIR):
             actions_tensor = torch.tensor(flat_actions, dtype=torch.long).to(DEVICE)
             log_probs_tensor = flat_log_probs.detach()
             
-            returns_tensor_raw = torch.tensor(batch_returns, device=DEVICE)
+            # --- [核心修改] ---
+            # 1. 直接使用原始的回报值作为 Critic 的目标，不再进行归一化
+            returns_tensor = torch.tensor(batch_returns, dtype=torch.float32, device=DEVICE)
+
+            # 2. 使用原始回报值计算解释方差
             states_conv_full = states_tensor[:, :agent.num_conv_features].reshape(-1, *agent.conv_input_shape)
             states_fc_full = states_tensor[:, agent.num_conv_features:]
             with torch.no_grad():
                 _, values_pred_full = agent.network(states_conv_full, states_fc_full)
             values_pred_full = values_pred_full.squeeze(-1)
             
-            running_mean = 0.99 * running_mean + 0.01 * returns_tensor_raw.mean().item()
-            running_std = 0.99 * running_std + 0.01 * returns_tensor_raw.std().item()
-            returns_tensor = (returns_tensor_raw - running_mean) / (running_std + 1e-8)
-            returns_tensor = torch.clamp(returns_tensor, -10, 10)
-
             try:
-                var_returns_normalized = torch.var(returns_tensor)
-                variance_of_residuals = torch.var(returns_tensor - values_pred_full)
-                explained_var = 1 - variance_of_residuals / (var_returns_normalized + 1e-8)
-                explained_variance_window.append(explained_var.item())
+                # 计算原始回报的方差
+                var_returns = torch.var(returns_tensor)
+                # 只有当回报存在方差时才计算 EV，避免除以零
+                if var_returns.item() > 1e-8:
+                    variance_of_residuals = torch.var(returns_tensor - values_pred_full)
+                    explained_var = 1 - variance_of_residuals / var_returns
+                    explained_variance_window.append(explained_var.item())
+                else:
+                    # 如果回报没有方差，则EV没有意义，可以记为0
+                    explained_variance_window.append(0.0)
             except Exception:
                 explained_variance_window.append(0)
 
-            advantages_tensor = torch.tensor(batch_advantages, device=DEVICE)
+            # 3. 保持对优势（advantages）的归一化，这是正确且必要的
+            advantages_tensor = torch.tensor(batch_advantages, dtype=torch.float32, device=DEVICE)
             advantages_tensor = normalize_tensor(advantages_tensor)
             advantages_tensor = torch.clamp(advantages_tensor, -10, 10)
             
@@ -302,7 +310,9 @@ def train_vs_random(n_episodes=N_EPISODES, max_t=MAX_T, log_dir=LOG_DIR):
                     indices = permutation[start:end]
 
                     mini_states, mini_actions, mini_log_probs = states_tensor[indices], actions_tensor[indices], log_probs_tensor[indices]
-                    mini_advantages, mini_returns = advantages_tensor[indices], returns_tensor[indices]
+                    mini_advantages = advantages_tensor[indices]
+                    # 4. [核心修改] 将原始的、未经归一化的回报传递给 learn 函数
+                    mini_returns = returns_tensor[indices]
 
                     num_conv_features = agent.num_conv_features
                     mini_states_conv = mini_states[:, :num_conv_features].reshape(-1, *agent.conv_input_shape)
@@ -310,7 +320,7 @@ def train_vs_random(n_episodes=N_EPISODES, max_t=MAX_T, log_dir=LOG_DIR):
                     
                     res = agent.learn(
                         mini_states_conv, mini_states_fc, mini_actions, mini_log_probs, 
-                        mini_advantages, mini_returns.float(), current_entropy_coef
+                        mini_advantages, mini_returns, current_entropy_coef
                     )
                     total_loss, actor_loss, critic_loss, avg_advantage, avg_value, kl_div, entropy = res
                     batch_kl_divs.append(kl_div)

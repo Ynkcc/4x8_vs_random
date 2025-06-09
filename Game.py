@@ -168,7 +168,7 @@ class GameEnvironment:
         move_norm = self.MAX_CONSECUTIVE_MOVES if self.MAX_CONSECUTIVE_MOVES > 0 else 1.0
         self._state_vector[self._move_counter_idx] = self.move_counter / move_norm
         
-        return self._state_vector
+        return self._state_vector.copy()
 
 
     def step(self, action_index):
